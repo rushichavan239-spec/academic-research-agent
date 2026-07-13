@@ -5,3 +5,4 @@ beautifulsoup4
 google-genai
 pydantic
 lxml
+gTTS
