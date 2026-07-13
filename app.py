@@ -5,6 +5,7 @@ import re
 from datetime import datetime
 from typing import List, Optional
 from urllib.parse import urljoin
+import io
 
 import aiohttp
 import streamlit as st
@@ -13,6 +14,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
+from gtts import gTTS
 
 # Streamlit पेज कॉन्फिगरेशन
 st.set_page_config(page_title="एआय रिसर्च एजंट (Gemini)", page_icon="📄", layout="wide")
@@ -47,10 +49,12 @@ class ArxivAPIIngestor:
                 if response.status != 200: return []
                 xml_data = await response.text()
                 return self._parse_xml(xml_data)
-        except Exception:
+        except Exception as e:
+            logger.error(f"Fetch papers failure: {str(e)}")
             return []
 
     def _parse_xml(self, xml_text: str) -> List[PaperMetadata]:
+        # lxml आणि xml parser चा वापर करून अचूक डेटा मिळवणे
         soup = BeautifulSoup(xml_text, "xml")
         papers = []
         for entry in soup.find_all("entry"):
@@ -80,7 +84,8 @@ class DocumentProcessor:
                 if response.status != 200: return None
                 pdf_bytes = await response.read()
             return await asyncio.to_thread(self._parse_pdf_bytes, pdf_bytes)
-        except Exception:
+        except Exception as e:
+            logger.error(f"PDF extraction failure: {str(e)}")
             return None
 
     def _parse_pdf_bytes(self, pdf_bytes: bytes) -> str:
@@ -88,7 +93,7 @@ class DocumentProcessor:
         text_list = []
         with io.BytesIO(pdf_bytes) as f:
             reader = PdfReader(f)
-            for page in reader.pages[:10]:
+            for page in reader.pages[:10]:  # पहिल्या १० पानांचे वाचन
                 text = page.extract_text()
                 if text: text_list.append(text)
         return "\n".join(text_list)
@@ -124,10 +129,10 @@ class GeminiSummarizationEngine:
 
 # --- Streamlit UI ---
 st.title("📄 स्वायत्त शैक्षणिक संशोधन एजंट (Powered by Gemini)")
-st.write("हा एआय एजंट बॅकग्राउंडमध्ये लपवलेल्या सुरक्षित Gemini APIचा वापर करून मोफत रिसर्च पेपर्सचा तांत्रिक सारांश तयार करतो.")
+st.write("हा एआय एजंट सुरक्षित Gemini API चा वापर करून मोफत रिसर्च पेपर्सचा तांत्रिक सारांश तयार करतो आणि तो ऐकवतो.")
 
-# मुख्य फॉर्म (आता इथे कोणतीही गुपिते उघडी पडणार नाहीत!)
-search_query = st.text_input("🔎 संशोधनाचा विषय टाईप करा:")
+# मुख्य शोध पट्टी
+search_query = st.text_input("🔎 संशोधनाचा विषय टाईप करा (उदा. 'RAG agents', 'LLM Alignment'):")
 limit = st.slider("किती पेपर्स शोधायचे आहेत?", min_value=1, max_value=5, value=2)
 
 async def start_pipeline(query: str, paper_limit: int, key: str):
@@ -140,7 +145,7 @@ async def start_pipeline(query: str, paper_limit: int, key: str):
         papers = await arxiv_source.fetch_papers(query, limit=paper_limit)
         
         if not papers:
-            st.error("एकही paper सापडला नाही.")
+            st.error("एकही paper सापडला नाही. (टीप: कृपया शोधताना सोपे शब्द वापरा किंवा Streamlit Cloud वरील Logs तपासा.)")
             return
 
         st.success(f"एकूण {len(papers)} पेपर्स सापडले. विश्लेषण सुरू आहे...")
@@ -159,22 +164,50 @@ async def start_pipeline(query: str, paper_limit: int, key: str):
                     summary = await llm_engine.summarize_paper(raw_text)
                     
                     if summary:
+                        # १. स्क्रीनवर टेक्स्ट दाखवणे
                         st.markdown("#### 🎯 मुख्य सारांश (Executive Summary)")
                         st.write(summary.executive_summary)
+                        
                         st.markdown("#### 💡 महत्त्वाचे मुद्दे (Key Highlights)")
+                        highlights_text = ""
                         for bullet in summary.key_highlights:
                             st.write(f"- {bullet}")
+                            highlights_text += f"{bullet}. "
+                            
                         st.markdown("#### 🚀 व्यावहारिक उपयोग (Practical Implications)")
                         st.write(summary.practical_implications)
+                        
+                        st.markdown("---")
+                        # २. 🎧 Read Aloud (Indian Accent Audio Player)
+                        st.markdown("#### 🎧 Read Aloud (Indian Accent)")
+                        
+                        full_audio_text = (
+                            f"Summary for the paper: {paper.title}. "
+                            f"Executive Summary: {summary.executive_summary} "
+                            f"Key Highlights: {highlights_text} "
+                            f"Practical Implications: {summary.practical_implications}"
+                        )
+                        
+                        try:
+                            # co.in मुळे ऑडिओ शुद्ध भारतीय इंग्रजी उच्चारात ऐकू येईल
+                            tts = gTTS(text=full_audio_text, lang='en', tld='co.in', slow=False)
+                            fp = io.BytesIO()
+                            tts.write_to_fp(fp)
+                            fp.seek(0)
+                            
+                            st.audio(fp, format='audio/mp3')
+                        except Exception as audio_err:
+                            logger.error(f"Audio creation failure: {str(audio_err)}")
+                            st.warning("ऑडिओ तयार करता आला नाही.")
                     else:
-                        st.error("सारांश तयार करताना एरर आली. (खर्च किंवा मर्यादा संपली असावी)")
+                        st.error("सारांश तयार करताना एरर आली. (तुमचा मोफत मिनिटाचा कोटा संपला असू शकतो.)")
 
 if st.button("🚀 एजंट सुरू करा"):
-    # थेट Streamlit Secrets मधून सुरक्षितपणे की शोधणे
+    # Streamlit Secrets मधून की मिळवणे (जी डॅशबोर्डवर सेट केली आहे)
     secure_key = st.secrets.get("GEMINI_API_KEY", "")
     
     if not secure_key:
-        st.error("त्रुटी: Streamlit Cloud मधील Secrets मध्ये 'GEMINI_API_KEY' सेट केलेली नाही! कृपया ती सेट करा.")
+        st.error("त्रुटी: Streamlit Cloud मधील Secrets मध्ये 'GEMINI_API_KEY' सेट केलेली नाही! कृपया ॲपच्या Settings -> Secrets मध्ये जाऊन ती सेव्ह करा.")
     elif not search_query:
         st.warning("कृपया संशोधनाचा विषय टाईप करा.")
     else:
