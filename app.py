@@ -88,7 +88,7 @@ class DocumentProcessor:
         text_list = []
         with io.BytesIO(pdf_bytes) as f:
             reader = PdfReader(f)
-            for page in reader.pages[:10]: # खर्च आणि गतीसाठी पहिली १० पाने
+            for page in reader.pages[:10]:
                 text = page.extract_text()
                 if text: text_list.append(text)
         return "\n".join(text_list)
@@ -96,14 +96,11 @@ class DocumentProcessor:
 # --- Gemini सारांश इंजिन ---
 class GeminiSummarizationEngine:
     def __init__(self, api_key: str):
-        # Google च्या अधिकृत नवीन SDK चा वापर
         self.client = genai.Client(api_key=api_key)
-        # आपण मोफत आणि वेगवान 'gemini-2.5-flash' मॉडेल वापरणार आहोत
         self.model_name = "gemini-2.5-flash" 
 
     async def summarize_paper(self, raw_text: str) -> Optional[PaperSummary]:
         try:
-            # Gemini ला स्ट्रक्चर्ड आऊटपुट (Pydantic) देण्यासाठी कॉन्फिगरेशन
             config = types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=PaperSummary,
@@ -111,7 +108,6 @@ class GeminiSummarizationEngine:
                 system_instruction="You are a Principal AI Architect. Analyze the research paper text and synthesize it into the requested JSON schema structure perfectly."
             )
             
-            # थ्रेड ब्लॉक होऊ नये म्हणून ब्याकग्राउंडमध्ये कॉल करणे
             response = await asyncio.to_thread(
                 self.client.models.generate_content,
                 model=self.model_name,
@@ -119,7 +115,6 @@ class GeminiSummarizationEngine:
                 config=config
             )
             
-            # मिळालेला डेटा पुन्हा Pydantic ऑब्जेक्टमध्ये रूपांतरित करणे
             if response.text:
                 return PaperSummary.model_validate_json(response.text)
             return None
@@ -129,14 +124,9 @@ class GeminiSummarizationEngine:
 
 # --- Streamlit UI ---
 st.title("📄 स्वायत्त शैक्षणिक संशोधन एजंट (Powered by Gemini)")
-st.write("हा एआय एजंट Google Gemini API चा वापर करून मोफत रिसर्च पेपर्सचा तांत्रिक सारांश तयार करतो.")
+st.write("हा एआय एजंट बॅकग्राउंडमध्ये लपवलेल्या सुरक्षित Gemini APIचा वापर करून मोफत रिसर्च पेपर्सचा तांत्रिक सारांश तयार करतो.")
 
-# डाव्या बाजूची पट्टी (Sidebar) - आता येथे की टाकण्याची सक्ती नाही (जर गुपचूप सेट केली असेल तर)
-st.sidebar.header("⚙️ कॉन्फिगरेशन")
-# आधी Streamlit Secrets मध्ये शोधेल, नसल्यास युझरला मागेल
-secret_key = st.secrets.get("GEMINI_API_KEY", "")
-api_key = st.sidebar.text_input("तुमची Gemini API Key टाका (ऐच्छिक):", value=secret_key, type="password")
-
+# मुख्य फॉर्म (आता इथे कोणतीही गुपिते उघडी पडणार नाहीत!)
 search_query = st.text_input("🔎 संशोधनाचा विषय टाईप करा:")
 limit = st.slider("किती पेपर्स शोधायचे आहेत?", min_value=1, max_value=5, value=2)
 
@@ -150,7 +140,7 @@ async def start_pipeline(query: str, paper_limit: int, key: str):
         papers = await arxiv_source.fetch_papers(query, limit=paper_limit)
         
         if not papers:
-            st.error("एकही पेपर सापडला नाही.")
+            st.error("एकही paper सापडला नाही.")
             return
 
         st.success(f"एकूण {len(papers)} पेपर्स सापडले. विश्लेषण सुरू आहे...")
@@ -177,12 +167,15 @@ async def start_pipeline(query: str, paper_limit: int, key: str):
                         st.markdown("#### 🚀 व्यावहारिक उपयोग (Practical Implications)")
                         st.write(summary.practical_implications)
                     else:
-                        st.error("सारांश तयार करताना एरर आली. (कदाचित मोफत की ची प्रति-मिनिट मर्यादा संपली असावी)")
+                        st.error("सारांश तयार करताना एरर आली. (खर्च किंवा मर्यादा संपली असावी)")
 
 if st.button("🚀 एजंट सुरू करा"):
-    if not api_key:
-        st.error("कृपया डाव्या बाजूला तुमची Gemini API Key टाका किंवा Secrets मध्ये सेट करा!")
+    # थेट Streamlit Secrets मधून सुरक्षितपणे की शोधणे
+    secure_key = st.secrets.get("GEMINI_API_KEY", "")
+    
+    if not secure_key:
+        st.error("त्रुटी: Streamlit Cloud मधील Secrets मध्ये 'GEMINI_API_KEY' सेट केलेली नाही! कृपया ती सेट करा.")
     elif not search_query:
         st.warning("कृपया संशोधनाचा विषय टाईप करा.")
     else:
-        asyncio.run(start_pipeline(search_query, limit, api_key))
+        asyncio.run(start_pipeline(search_query, limit, secure_key))
