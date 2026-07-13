@@ -1,7 +1,6 @@
 streamlit
 aiohttp
 pypdf
-instructor
-openai
-pydantic
 beautifulsoup4
+google-genai
+pydantic
