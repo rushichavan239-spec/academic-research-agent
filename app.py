@@ -7,36 +7,35 @@ from typing import List, Optional
 from urllib.parse import urljoin
 
 import aiohttp
-import instructor
 import streamlit as st
 from bs4 import BeautifulSoup
-from openai import AsyncOpenAI
+from google import genai
+from google.genai import types
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
 
 # Streamlit पेज कॉन्फिगरेशन
-st.set_page_config(page_title="एआय रिसर्च एजंट", page_icon="📄", layout="wide")
+st.set_page_config(page_title="एआय रिसर्च एजंट (Gemini)", page_icon="📄", layout="wide")
 
 # लॉगींग सेटअप
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AcademicAgent")
 
-# --- डाटा स्क्रीप्ट / साचे (Schemas) ---
+# --- डेटा साचे (Schemas) ---
 class PaperMetadata(BaseModel):
-    title: str = Field(..., description="संशोधन पत्रिकेचे नाव (Title)")
-    authors: List[str] = Field(..., description="लेखकांची नावे")
-    university: str = Field(..., description="विद्यापीठ किंवा स्त्रोत")
-    publication_date: str = Field(..., description="प्रकाशन तारीख")
-    link: str = Field(..., description="मूळ लिंक")
-    pdf_link: str = Field(..., description="पीडीएफ डाऊनलोड लिंक")
+    title: str
+    authors: List[str]
+    university: str
+    publication_date: str
+    link: str
+    pdf_link: str
 
 class PaperSummary(BaseModel):
-    metadata: PaperMetadata
-    executive_summary: str = Field(..., description="२-३ ओळीत मुख्य शोध/ब्रेकथ्रू")
-    key_highlights: List[str] = Field(..., description="महत्त्वाचे मुद्दे (पद्धती, निष्कर्ष, आकडेवारी)")
-    practical_implications: str = Field(..., description="या संशोधनाचा भविष्यात काय फायदा होईल?")
+    executive_summary: str = Field(..., description="2-3 sentences explaining the core breakthrough in English.")
+    key_highlights: List[str] = Field(..., description="Bullet points detailing methodology and findings in English.")
+    practical_implications: str = Field(..., description="Why this paper matters in English.")
 
-# --- पेपर्स शोधणारे घटक (Ingestion) ---
+# --- पेपर्स शोधणारे घटक (arXiv Ingestion) ---
 class ArxivAPIIngestor:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
@@ -89,122 +88,100 @@ class DocumentProcessor:
         text_list = []
         with io.BytesIO(pdf_bytes) as f:
             reader = PdfReader(f)
-            for page in reader.pages[:10]: # खूप मोठा पेपर असेल तर सुरुवातीची १० पाने वाचणे (खर्च वाचवण्यासाठी)
+            for page in reader.pages[:10]: # खर्च आणि गतीसाठी पहिली १० पाने
                 text = page.extract_text()
                 if text: text_list.append(text)
         return "\n".join(text_list)
 
-# --- एआय सारांश इंजिन ---
-class LLMSummarizationEngine:
+# --- Gemini सारांश इंजिन ---
+class GeminiSummarizationEngine:
     def __init__(self, api_key: str):
-        self.client = instructor.patch(AsyncOpenAI(api_key=api_key))
-        self.chunk_size = 12000 
+        # Google च्या अधिकृत नवीन SDK चा वापर
+        self.client = genai.Client(api_key=api_key)
+        # आपण मोफत आणि वेगवान 'gemini-2.5-flash' मॉडेल वापरणार आहोत
+        self.model_name = "gemini-2.5-flash" 
 
-    def _chunk_text(self, text: str) -> List[str]:
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        chunks, current, length = [], [], 0
-        for s in sentences:
-            current.append(s)
-            length += len(s)
-            if length >= self.chunk_size:
-                chunks.append(" ".join(current))
-                current, length = [], 0
-        if current: chunks.append(" ".join(current))
-        return chunks
-
-    async def _map_summarize_chunk(self, chunk: str) -> str:
+    async def summarize_paper(self, raw_text: str) -> Optional[PaperSummary]:
         try:
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a research scientist. Extract key technical findings."},
-                    {"role": "user", "content": chunk}
-                ],
-                temperature=0.2
+            # Gemini ला स्ट्रक्चर्ड आऊटपुट (Pydantic) देण्यासाठी कॉन्फिगरेशन
+            config = types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=PaperSummary,
+                temperature=0.3,
+                system_instruction="You are a Principal AI Architect. Analyze the research paper text and synthesize it into the requested JSON schema structure perfectly."
             )
-            return response.choices[0].message.content or ""
-        except Exception:
-            return ""
-
-    async def summarize_paper(self, raw_text: str, metadata: PaperMetadata) -> Optional[PaperSummary]:
-        chunks = self._chunk_text(raw_text)
-        map_tasks = [self._map_summarize_chunk(c) for c in chunks]
-        map_results = await asyncio.gather(*map_tasks)
-        
-        combined_text = "\n\n".join(map_results)
-        try:
-            final_summary: PaperSummary = await self.client.chat.completions.create(
-                model="gpt-4o",
-                response_model=PaperSummary,
-                messages=[
-                    {"role": "system", "content": "Synthesize the provided text into a unified, high-quality research summary in English."},
-                    {"role": "user", "content": combined_text}
-                ],
-                temperature=0.3
+            
+            # थ्रेड ब्लॉक होऊ नये म्हणून ब्याकग्राउंडमध्ये कॉल करणे
+            response = await asyncio.to_thread(
+                self.client.models.generate_content,
+                model=self.model_name,
+                contents=f"Analyze this research paper text and extract structured summary:\n\n{raw_text}",
+                config=config
             )
-            final_summary.metadata = metadata
-            return final_summary
-        except Exception:
+            
+            # मिळालेला डेटा पुन्हा Pydantic ऑब्जेक्टमध्ये रूपांतरित करणे
+            if response.text:
+                return PaperSummary.model_validate_json(response.text)
+            return None
+        except Exception as e:
+            logger.error(f"Gemini एरर: {str(e)}")
             return None
 
-# --- Streamlit UI मांडणी ---
-st.title("📄 स्वायत्त शैक्षणिक संशोधन एजंट")
-st.write("हा एआय एजंट जगभरातील रिसर्च पेपर्स शोधून त्यांचा सखोल तांत्रिक सारांश तयार करतो.")
+# --- Streamlit UI ---
+st.title("📄 स्वायत्त शैक्षणिक संशोधन एजंट (Powered by Gemini)")
+st.write("हा एआय एजंट Google Gemini API चा वापर करून मोफत रिसर्च पेपर्सचा तांत्रिक सारांश तयार करतो.")
 
-# डाव्या बाजूची पट्टी (Sidebar)
+# डाव्या बाजूची पट्टी (Sidebar) - आता येथे की टाकण्याची सक्ती नाही (जर गुपचूप सेट केली असेल तर)
 st.sidebar.header("⚙️ कॉन्फिगरेशन")
-api_key = st.sidebar.text_input("तुमची OpenAI API Key टाका:", type="password")
-st.sidebar.markdown("[OpenAI API Key कशी मिळवावी?](https://platform.openai.com/api-keys)")
+# आधी Streamlit Secrets मध्ये शोधेल, नसल्यास युझरला मागेल
+secret_key = st.secrets.get("GEMINI_API_KEY", "")
+api_key = st.sidebar.text_input("तुमची Gemini API Key टाका (ऐच्छिक):", value=secret_key, type="password")
 
-# मुख्य फॉर्म
-search_query = st.text_input("🔎 संशोधनाचा विषय टाईप करा (उदा. 'Retrieval-Augmented Generation', 'Quantum Computing'):")
+search_query = st.text_input("🔎 संशोधनाचा विषय टाईप करा:")
 limit = st.slider("किती पेपर्स शोधायचे आहेत?", min_value=1, max_value=5, value=2)
 
 async def start_pipeline(query: str, paper_limit: int, key: str):
     async with aiohttp.ClientSession() as session:
         arxiv_source = ArxivAPIIngestor(session)
         doc_processor = DocumentProcessor(session)
-        llm_engine = LLMSummarizationEngine(api_key=key)
+        llm_engine = GeminiSummarizationEngine(api_key=key)
         
         st.info(f"🔍 '{query}' या विषयावर पेपर्स शोधत आहे...")
         papers = await arxiv_source.fetch_papers(query, limit=paper_limit)
         
         if not papers:
-            st.error("एकही पेपर सापडला नाही. कृपया दुसरा विषय शोधून पहा.")
+            st.error("एकही पेपर सापडला नाही.")
             return
 
-        st.success(f"कुल {len(papers)} पेपर्स सापडले. आता त्यांचे वाचन आणि विश्लेषण सुरू आहे...")
+        st.success(f"एकूण {len(papers)} पेपर्स सापडले. विश्लेषण सुरू आहे...")
         
         for i, paper in enumerate(papers):
             with st.expander(f"📄 Paper {i+1}: {paper.title}", expanded=True):
                 st.markdown(f"**🗓️ तारीख:** {paper.publication_date} | **✍️ लेखक:** {', '.join(paper.authors)}")
-                st.markdown(f"🔗 [मूळ लिंक]({paper.link}) | 📥 [पीडीएफ डाऊनलोड लिंक]({paper.pdf_link})")
+                st.markdown(f"🔗 [मूळ लिंक]({paper.link}) | 📥 [पीडीएफ लिंक]({paper.pdf_link})")
                 
-                with st.spinner("एआय एजंट पीडीएफ वाचत आहे आणि विश्लेषण करत आहे..."):
+                with st.spinner("Gemini पेपरचे विश्लेषण करत आहे..."):
                     raw_text = await doc_processor.extract_text_from_pdf(paper.pdf_link)
-                    
                     if not raw_text:
-                        st.error("या पेपरची पीडीएफ फाईल वाचता आली नाही.")
+                        st.error("पीडीएफ वाचता आली नाही.")
                         continue
                         
-                    summary = await llm_engine.summarize_paper(raw_text, paper)
+                    summary = await llm_engine.summarize_paper(raw_text)
                     
                     if summary:
                         st.markdown("#### 🎯 मुख्य सारांश (Executive Summary)")
                         st.write(summary.executive_summary)
-                        
                         st.markdown("#### 💡 महत्त्वाचे मुद्दे (Key Highlights)")
                         for bullet in summary.key_highlights:
                             st.write(f"- {bullet}")
-                            
                         st.markdown("#### 🚀 व्यावहारिक उपयोग (Practical Implications)")
                         st.write(summary.practical_implications)
                     else:
-                        st.error("एआय सारांश तयार करू शकला नाही.")
+                        st.error("सारांश तयार करताना एरर आली. (कदाचित मोफत की ची प्रति-मिनिट मर्यादा संपली असावी)")
 
 if st.button("🚀 एजंट सुरू करा"):
     if not api_key:
-        st.error("कृपया डाव्या बाजूच्या पट्टीमध्ये तुमची OpenAI API Key टाका!")
+        st.error("कृपया डाव्या बाजूला तुमची Gemini API Key टाका किंवा Secrets मध्ये सेट करा!")
     elif not search_query:
         st.warning("कृपया संशोधनाचा विषय टाईप करा.")
     else:
