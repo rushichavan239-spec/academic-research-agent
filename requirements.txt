@@ -1,8 +1,7 @@
-streamlit==1.42.0
-aiohttp==3.11.11
-pypdf==5.1.0
-instructor==1.7.0
-openai==1.60.1
-pydantic==2.10.6
-beautifulsoup4==4.12.3
-lxml==5.3.0
+streamlit
+aiohttp
+pypdf
+instructor
+openai
+pydantic
+beautifulsoup4
