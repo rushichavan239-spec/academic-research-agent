@@ -1,15 +1,16 @@
 """
-Autonomous Academic Research Agent
-------------------------------------
-Fetches papers from arXiv, extracts full text from the underlying PDFs,
-summarizes them bilingually (English + Marathi) using Google Gemini
-structured outputs, and renders a side-by-side dashboard with an
-Indian-accent text-to-speech "read aloud" feature.
+Autonomous Academic Research Agent — Institutional Target Filtering Edition
+-----------------------------------------------------------------------------
+Fetches papers from arXiv (with optional premier-institution boolean
+filtering), extracts full text from the underlying PDFs, summarizes them
+bilingually (English + Marathi) using Google Gemini structured outputs, and
+renders a side-by-side dashboard with an Indian-accent text-to-speech
+"read aloud" feature.
 
 Run locally:
     streamlit run app.py
 
-Requires a Streamlit secret named GEMINI_API_KEY (see README instructions).
+Requires a Streamlit secret named GEMINI_API_KEY (see deployment instructions).
 """
 
 from __future__ import annotations
@@ -18,8 +19,9 @@ import asyncio
 import io
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
+from urllib.parse import quote
 
 import aiohttp
 import streamlit as st
@@ -35,11 +37,21 @@ from google.genai import types
 # Constants
 # --------------------------------------------------------------------------
 
-ARXIV_API_URL = "http://export.arxiv.org/api/query"
+ARXIV_API_BASE_URL = "http://export.arxiv.org/api/query"
 GEMINI_MODEL = "gemini-2.5-flash"
 MAX_PDF_PAGES = 10
 MAX_EXTRACTED_CHARS = 40_000  # cap the text sent to Gemini for cost/latency control
 HTTP_TIMEOUT_SECONDS = 60
+
+PREMIER_INSTITUTIONS = [
+    "MIT",
+    "Stanford",
+    "Harvard",
+    "Oxford",
+    "Cambridge",
+    "UC Berkeley",
+    "Carnegie Mellon",
+]
 
 
 # --------------------------------------------------------------------------
@@ -50,22 +62,22 @@ class PaperSummary(BaseModel):
     """Structured bilingual summary returned by Gemini."""
 
     executive_summary_en: str = Field(
-        description="A concise 2-3 sentence executive summary of the paper in English."
+        description="A concise 2-3 sentence professional executive summary of the paper in English."
     )
     executive_summary_mr: str = Field(
-        description="A concise 2-3 sentence executive summary of the paper in fluent, natural Marathi."
+        description="A concise 2-3 sentence executive summary of the paper in fluent, easy-to-understand Marathi."
     )
     key_highlights_en: List[str] = Field(
-        description="A list of 3-6 key bullet-point highlights of the paper in English."
+        description="A list of 3-6 key bullet-point highlights/findings of the paper in English."
     )
     key_highlights_mr: List[str] = Field(
-        description="The same key highlights translated into fluent, natural Marathi, 3-6 bullet points."
+        description="The same key highlights/findings translated into fluent, natural Marathi, 3-6 bullet points."
     )
     practical_implications_en: str = Field(
-        description="2-3 sentences describing the practical/industry implications of this research in English."
+        description="2-3 sentences describing the practical/industry impact and why this research matters, in English."
     )
     practical_implications_mr: str = Field(
-        description="2-3 sentences describing the practical/industry implications of this research in fluent Marathi."
+        description="2-3 sentences describing the practical/industry impact and why this research matters, in fluent Marathi."
     )
 
 
@@ -77,6 +89,7 @@ class ArxivPaper:
     abstract: str
     pdf_link: str
     arxiv_id: str
+    target_institutions: List[str]  # institution filters that were applied to this search
 
 
 @dataclass
@@ -89,25 +102,65 @@ class ProcessedPaper:
 
 
 # --------------------------------------------------------------------------
+# Advanced arXiv Query Builder
+# --------------------------------------------------------------------------
+
+def build_arxiv_search_query(topic: str, institutions: List[str]) -> str:
+    """Dynamically build the arXiv `search_query` value.
+
+    If institutions are selected, an institutional boolean filter clause is
+    appended, e.g.:
+        all:transformers AND (institution:MIT OR institution:Stanford)
+    """
+    base_clause = f"all:{topic}"
+
+    if institutions:
+        institution_clause = " OR ".join(f'institution:{inst}' for inst in institutions)
+        return f"{base_clause} AND ({institution_clause})"
+
+    return base_clause
+
+
+def build_arxiv_request_url(topic: str, institutions: List[str], max_results: int) -> str:
+    """Construct the full arXiv API URL, explicitly URL-encoding the
+    dynamically built search_query parameter via urllib.parse.quote.
+    """
+    search_query = build_arxiv_search_query(topic, institutions)
+
+    # Preserve boolean/query syntax characters that arXiv expects unescaped
+    # (parentheses and colons) while safely encoding everything else
+    # (spaces, quotes, etc.).
+    encoded_query = quote(search_query, safe='():')
+
+    query_string = (
+        f"search_query={encoded_query}"
+        f"&start=0"
+        f"&max_results={max_results}"
+        f"&sortBy=relevance"
+        f"&sortOrder=descending"
+    )
+
+    return f"{ARXIV_API_BASE_URL}?{query_string}"
+
+
+# --------------------------------------------------------------------------
 # arXiv Ingestion
 # --------------------------------------------------------------------------
 
 async def search_arxiv(
-    session: aiohttp.ClientSession, query: str, max_results: int
+    session: aiohttp.ClientSession,
+    topic: str,
+    institutions: List[str],
+    max_results: int,
 ) -> List[ArxivPaper]:
-    """Query the official arXiv API and safely parse the Atom/XML response."""
-    params = {
-        "search_query": f"all:{query}",
-        "start": "0",
-        "max_results": str(max_results),
-        "sortBy": "relevance",
-        "sortOrder": "descending",
-    }
+    """Query the official arXiv API with the advanced institutional filter
+    and safely parse the resulting Atom/XML feed.
+    """
+    url = build_arxiv_request_url(topic, institutions, max_results)
+
     try:
         async with session.get(
-            ARXIV_API_URL,
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=30),
+            url, timeout=aiohttp.ClientTimeout(total=30)
         ) as resp:
             resp.raise_for_status()
             raw_xml = await resp.text()
@@ -146,7 +199,6 @@ async def search_arxiv(
                     pdf_link = link.get("href")
                     break
             if not pdf_link and arxiv_id:
-                # Fallback: derive the PDF URL from the abstract page URL
                 pdf_link = arxiv_id.replace("/abs/", "/pdf/")
 
             if not pdf_link:
@@ -160,6 +212,7 @@ async def search_arxiv(
                     abstract=abstract,
                     pdf_link=pdf_link,
                     arxiv_id=arxiv_id,
+                    target_institutions=institutions,
                 )
             )
         except Exception:  # noqa: BLE001
@@ -211,11 +264,16 @@ async def extract_paper_text(session: aiohttp.ClientSession, pdf_link: str) -> s
 # Gemini Structured Bilingual Summarization
 # --------------------------------------------------------------------------
 
-def _build_prompt(title: str, abstract: str, body_text: str) -> str:
+def _build_prompt(title: str, abstract: str, body_text: str, institutions: List[str]) -> str:
+    institution_context = (
+        f"\nNote: This search was filtered for target institutions: {', '.join(institutions)}.\n"
+        if institutions
+        else ""
+    )
     return f"""You are an expert bilingual academic research analyst fluent in English and Marathi.
 
 Analyze the following research paper and produce a structured bilingual summary.
-
+{institution_context}
 PAPER TITLE:
 {title}
 
@@ -226,19 +284,21 @@ EXTRACTED BODY TEXT (first pages):
 {body_text}
 
 Instructions:
-- Write clear, accurate, and natural English.
-- Write fluent, natural, grammatically correct Marathi (not a literal word-for-word translation) that an educated Marathi reader would find natural to read. Use Devanagari script.
+- Write clear, accurate, and professional English.
+- Write fluent, natural, grammatically correct, easy-to-understand Marathi (not a literal word-for-word translation) that an educated Marathi reader would find natural to read. Use Devanagari script.
 - executive_summary: 2-3 sentences capturing the core contribution of the paper.
 - key_highlights: 3-6 concise bullet points capturing the most important technical points/findings.
-- practical_implications: 2-3 sentences on real-world, industry, or societal impact.
+- practical_implications: 2-3 sentences on real-world, industry, or societal impact — why this research matters.
 - Keep both language versions semantically equivalent in meaning.
 Respond strictly according to the provided JSON schema.
 """
 
 
-def _call_gemini_sync(client: genai.Client, title: str, abstract: str, body_text: str) -> PaperSummary:
+def _call_gemini_sync(
+    client: genai.Client, title: str, abstract: str, body_text: str, institutions: List[str]
+) -> PaperSummary:
     """Synchronous Gemini call (the SDK is sync); wrapped via asyncio.to_thread by the caller."""
-    prompt = _build_prompt(title, abstract, body_text)
+    prompt = _build_prompt(title, abstract, body_text, institutions)
 
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
@@ -264,9 +324,11 @@ def _call_gemini_sync(client: genai.Client, title: str, abstract: str, body_text
 
 
 async def summarize_paper_bilingual(
-    client: genai.Client, title: str, abstract: str, body_text: str
+    client: genai.Client, title: str, abstract: str, body_text: str, institutions: List[str]
 ) -> PaperSummary:
-    return await asyncio.to_thread(_call_gemini_sync, client, title, abstract, body_text)
+    return await asyncio.to_thread(
+        _call_gemini_sync, client, title, abstract, body_text, institutions
+    )
 
 
 # --------------------------------------------------------------------------
@@ -303,7 +365,9 @@ async def process_single_paper(
         body_text = await extract_paper_text(session, paper.pdf_link)
         result.extracted_chars = len(body_text)
 
-        summary = await summarize_paper_bilingual(client, paper.title, paper.abstract, body_text)
+        summary = await summarize_paper_bilingual(
+            client, paper.title, paper.abstract, body_text, paper.target_institutions
+        )
         result.summary = summary
 
         speech_text = build_speech_text(summary)
@@ -316,12 +380,12 @@ async def process_single_paper(
 
 
 async def run_research_pipeline(
-    query: str, max_results: int, api_key: str
+    topic: str, institutions: List[str], max_results: int, api_key: str
 ) -> List[ProcessedPaper]:
     client = genai.Client(api_key=api_key)
 
     async with aiohttp.ClientSession() as session:
-        papers = await search_arxiv(session, query, max_results)
+        papers = await search_arxiv(session, topic, institutions, max_results)
         if not papers:
             return []
 
@@ -351,12 +415,19 @@ def render_paper_result(index: int, item: ProcessedPaper) -> None:
 
     with st.container(border=True):
         st.subheader(f"{index}. {paper.title}")
-        meta_cols = st.columns([3, 2])
+
+        meta_cols = st.columns([3, 2, 2])
         with meta_cols[0]:
             authors_str = ", ".join(paper.authors) if paper.authors else "Unknown authors"
             st.caption(f"👤 {authors_str}")
         with meta_cols[1]:
             st.caption(f"🗓️ Published: {paper.published[:10]}")
+        with meta_cols[2]:
+            if paper.target_institutions:
+                st.caption(f"🏛️ Target filter: {', '.join(paper.target_institutions)}")
+            else:
+                st.caption("🏛️ Target filter: All institutions")
+
         st.markdown(f"[🔗 View PDF]({paper.pdf_link})")
 
         if item.error:
@@ -412,8 +483,8 @@ def main() -> None:
     st.title("🔬 Autonomous Academic Research Agent")
     st.markdown(
         "Fetch, analyze, and synthesize research papers from **arXiv** into a bilingual "
-        "**English ↔ Marathi** dashboard, complete with Indian-accent audio narration — "
-        "powered by Google Gemini."
+        "**English ↔ Marathi** dashboard, with optional filtering by premier institutions "
+        "and Indian-accent audio narration — powered by Google Gemini."
     )
 
     api_key = get_api_key()
@@ -426,14 +497,26 @@ def main() -> None:
 
     st.markdown("---")
 
-    input_col, slider_col = st.columns([3, 1])
-    with input_col:
-        query = st.text_input(
-            "🔎 Research topic",
-            placeholder="e.g. retrieval augmented generation, quantum error correction, transformer efficiency",
+    query = st.text_input(
+        "🔎 Research topic",
+        placeholder="e.g. retrieval augmented generation, quantum error correction, transformer efficiency",
+    )
+
+    filter_col, slider_col = st.columns([3, 1])
+    with filter_col:
+        institutions = st.multiselect(
+            "🏛️ Filter by target institutions (optional)",
+            options=PREMIER_INSTITUTIONS,
+            default=[],
+            help="Leave empty to search across all institutions. When selected, the arXiv "
+                 "query is dynamically rebuilt with an institutional boolean filter clause.",
         )
     with slider_col:
         max_results = st.slider("Paper search limit", min_value=1, max_value=5, value=3)
+
+    with st.expander("🧠 Preview generated arXiv query"):
+        preview_query = build_arxiv_search_query(query.strip() or "<topic>", institutions)
+        st.code(preview_query, language="text")
 
     run_clicked = st.button("🚀 Run Research Agent", type="primary", use_container_width=False)
 
@@ -448,12 +531,13 @@ def main() -> None:
 
         try:
             with status_placeholder:
+                filter_msg = f" filtered to {', '.join(institutions)}" if institutions else ""
                 with st.spinner(
-                    f"Searching arXiv, downloading PDFs, and generating bilingual "
+                    f"Searching arXiv{filter_msg}, downloading PDFs, and generating bilingual "
                     f"Gemini summaries for up to {max_results} paper(s)..."
                 ):
                     results = asyncio.run(
-                        run_research_pipeline(clean_query, max_results, api_key)
+                        run_research_pipeline(clean_query, institutions, max_results, api_key)
                     )
         except Exception as exc:  # noqa: BLE001
             status_placeholder.empty()
@@ -466,7 +550,10 @@ def main() -> None:
         elapsed = time.time() - start_time
 
         if not results:
-            st.warning("No papers were found for this query. Try a different or broader topic.")
+            st.warning(
+                "No papers were found for this query and institutional filter combination. "
+                "Try broadening the topic or clearing the institution filter."
+            )
             st.stop()
 
         st.success(f"✅ Processed {len(results)} paper(s) in {elapsed:.1f}s.")
