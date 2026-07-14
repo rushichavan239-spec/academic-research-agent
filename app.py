@@ -1,231 +1,481 @@
+"""
+Autonomous Academic Research Agent
+------------------------------------
+Fetches papers from arXiv, extracts full text from the underlying PDFs,
+summarizes them bilingually (English + Marathi) using Google Gemini
+structured outputs, and renders a side-by-side dashboard with an
+Indian-accent text-to-speech "read aloud" feature.
+
+Run locally:
+    streamlit run app.py
+
+Requires a Streamlit secret named GEMINI_API_KEY (see README instructions).
+"""
+
+from __future__ import annotations
+
 import asyncio
-import logging
-import os
-import re
-from datetime import datetime
-from typing import List, Optional
-from urllib.parse import urljoin
 import io
+import time
+import traceback
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 import aiohttp
 import streamlit as st
 from bs4 import BeautifulSoup
-from google import genai
-from google.genai import types
+from gtts import gTTS
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
-from gtts import gTTS
 
-# Streamlit पेज कॉन्फिगरेशन
-st.set_page_config(page_title="एआय रिसर्च एजंट (द्विभाषिक)", page_icon="📄", layout="wide")
+from google import genai
+from google.genai import types
 
-# लॉगींग सेटअप
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("AcademicAgent")
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
 
-# --- डेटा साचे (Schemas) ---
-class PaperMetadata(BaseModel):
-    title: str
-    authors: List[str]
-    university: str
-    publication_date: str
-    link: str
-    pdf_link: str
+ARXIV_API_URL = "http://export.arxiv.org/api/query"
+GEMINI_MODEL = "gemini-2.5-flash"
+MAX_PDF_PAGES = 10
+MAX_EXTRACTED_CHARS = 40_000  # cap the text sent to Gemini for cost/latency control
+HTTP_TIMEOUT_SECONDS = 60
+
+
+# --------------------------------------------------------------------------
+# Pydantic Schemas
+# --------------------------------------------------------------------------
 
 class PaperSummary(BaseModel):
-    # स्क्रीनवर दोन्ही भाषांमध्ये दाखवण्यासाठी स्ट्रक्चर्स
-    executive_summary_en: str = Field(..., description="2-3 sentences explaining the core breakthrough in English.")
-    executive_summary_mr: str = Field(..., description="Core breakthrough translated/explained in simple Marathi.")
-    
-    key_highlights_en: List[str] = Field(..., description="Bullet points detailing methodology and findings in English.")
-    key_highlights_mr: List[str] = Field(..., description="The same key highlights translated/explained in simple Marathi.")
-    
-    practical_implications_en: str = Field(..., description="Why this paper matters in English.")
-    practical_implications_mr: str = Field(..., description="Why this paper matters explained in simple Marathi.")
+    """Structured bilingual summary returned by Gemini."""
 
-# --- पेपर्स शोधणारे घटक (arXiv Ingestion) ---
-class ArxivAPIIngestor:
-    def __init__(self, session: aiohttp.ClientSession):
-        self.session = session
+    executive_summary_en: str = Field(
+        description="A concise 2-3 sentence executive summary of the paper in English."
+    )
+    executive_summary_mr: str = Field(
+        description="A concise 2-3 sentence executive summary of the paper in fluent, natural Marathi."
+    )
+    key_highlights_en: List[str] = Field(
+        description="A list of 3-6 key bullet-point highlights of the paper in English."
+    )
+    key_highlights_mr: List[str] = Field(
+        description="The same key highlights translated into fluent, natural Marathi, 3-6 bullet points."
+    )
+    practical_implications_en: str = Field(
+        description="2-3 sentences describing the practical/industry implications of this research in English."
+    )
+    practical_implications_mr: str = Field(
+        description="2-3 sentences describing the practical/industry implications of this research in fluent Marathi."
+    )
 
-    async def fetch_papers(self, query: str, limit: int = 5) -> List[PaperMetadata]:
-        url = f"http://export.arxiv.org/api/query?search_query=all:{query}&max_results={limit}"
+
+@dataclass
+class ArxivPaper:
+    title: str
+    authors: List[str]
+    published: str
+    abstract: str
+    pdf_link: str
+    arxiv_id: str
+
+
+@dataclass
+class ProcessedPaper:
+    paper: ArxivPaper
+    summary: Optional[PaperSummary] = None
+    error: Optional[str] = None
+    extracted_chars: int = 0
+    audio_bytes: Optional[bytes] = None
+
+
+# --------------------------------------------------------------------------
+# arXiv Ingestion
+# --------------------------------------------------------------------------
+
+async def search_arxiv(
+    session: aiohttp.ClientSession, query: str, max_results: int
+) -> List[ArxivPaper]:
+    """Query the official arXiv API and safely parse the Atom/XML response."""
+    params = {
+        "search_query": f"all:{query}",
+        "start": "0",
+        "max_results": str(max_results),
+        "sortBy": "relevance",
+        "sortOrder": "descending",
+    }
+    try:
+        async with session.get(
+            ARXIV_API_URL,
+            params=params,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            resp.raise_for_status()
+            raw_xml = await resp.text()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Failed to reach arXiv API: {exc}") from exc
+
+    try:
+        soup = BeautifulSoup(raw_xml, "lxml-xml")
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Failed to parse arXiv XML response: {exc}") from exc
+
+    papers: List[ArxivPaper] = []
+    for entry in soup.find_all("entry"):
         try:
-            async with self.session.get(url, timeout=15) as response:
-                if response.status != 200: return []
-                xml_data = await response.text()
-                return self._parse_xml(xml_data)
-        except Exception as e:
-            logger.error(f"Fetch papers failure: {str(e)}")
-            return []
+            title_tag = entry.find("title")
+            title = title_tag.get_text(strip=True).replace("\n", " ") if title_tag else "Untitled"
 
-    def _parse_xml(self, xml_text: str) -> List[PaperMetadata]:
-        soup = BeautifulSoup(xml_text, "xml")
-        papers = []
-        for entry in soup.find_all("entry"):
-            try:
-                title = entry.title.text.strip().replace("\n", " ")
-                authors = [a.find("name").text.strip() for a in entry.find_all("author")]
-                pub_date = entry.published.text.strip()[:10]
-                link = entry.id.text.strip()
-                pdf_link = link.replace("abs", "pdf") + ".pdf"
-                
-                papers.append(PaperMetadata(
-                    title=title, authors=authors, university="arXiv Repository",
-                    publication_date=pub_date, link=link, pdf_link=pdf_link
-                ))
-            except Exception:
+            authors = [
+                a.find("name").get_text(strip=True)
+                for a in entry.find_all("author")
+                if a.find("name")
+            ]
+
+            published_tag = entry.find("published")
+            published = published_tag.get_text(strip=True) if published_tag else "Unknown"
+
+            summary_tag = entry.find("summary")
+            abstract = summary_tag.get_text(strip=True) if summary_tag else ""
+
+            id_tag = entry.find("id")
+            arxiv_id = id_tag.get_text(strip=True) if id_tag else ""
+
+            pdf_link = None
+            for link in entry.find_all("link"):
+                if link.get("title") == "pdf" or link.get("type") == "application/pdf":
+                    pdf_link = link.get("href")
+                    break
+            if not pdf_link and arxiv_id:
+                # Fallback: derive the PDF URL from the abstract page URL
+                pdf_link = arxiv_id.replace("/abs/", "/pdf/")
+
+            if not pdf_link:
                 continue
-        return papers
 
-# --- पीडीएफ मधून मजकूर काढणे ---
-class DocumentProcessor:
-    def __init__(self, session: aiohttp.ClientSession):
-        self.session = session
-
-    async def extract_text_from_pdf(self, pdf_url: str) -> Optional[str]:
-        try:
-            async with self.session.get(pdf_url, timeout=30) as response:
-                if response.status != 200: return None
-                pdf_bytes = await response.read()
-            return await asyncio.to_thread(self._parse_pdf_bytes, pdf_bytes)
-        except Exception as e:
-            logger.error(f"PDF extraction failure: {str(e)}")
-            return None
-
-    def _parse_pdf_bytes(self, pdf_bytes: bytes) -> str:
-        import io
-        text_list = []
-        with io.BytesIO(pdf_bytes) as f:
-            reader = PdfReader(f)
-            for page in reader.pages[:10]:  # पहिल्या १० पानांचे वाचन
-                text = page.extract_text()
-                if text: text_list.append(text)
-        return "\n".join(text_list)
-
-# --- Gemini सारांश इंजिन ---
-class GeminiSummarizationEngine:
-    def __init__(self, api_key: str):
-        self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-2.5-flash" 
-
-    async def summarize_paper(self, raw_text: str) -> Optional[PaperSummary]:
-        try:
-            config = types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=PaperSummary,
-                temperature=0.3,
-                system_instruction=(
-                    "You are a Principal AI Architect. Analyze the research paper text. "
-                    "Provide the summary fields strictly matching the schema. For English fields, write in professional technical English. "
-                    "For Marathi fields, translate and explain the technical concepts in fluent, easy-to-understand Marathi."
+            papers.append(
+                ArxivPaper(
+                    title=title,
+                    authors=authors,
+                    published=published,
+                    abstract=abstract,
+                    pdf_link=pdf_link,
+                    arxiv_id=arxiv_id,
                 )
             )
-            
-            response = await asyncio.to_thread(
-                self.client.models.generate_content,
-                model=self.model_name,
-                contents=f"Analyze this research paper text and extract the structured bilingual summary:\n\n{raw_text}",
-                config=config
-            )
-            
-            if response.text:
-                return PaperSummary.model_validate_json(response.text)
-            return None
-        except Exception as e:
-            logger.error(f"Gemini एरर: {str(e)}")
-            return None
+        except Exception:  # noqa: BLE001
+            # Skip malformed entries but keep processing the rest
+            continue
 
-# --- Streamlit UI ---
-st.title("📄 स्वायत्त शैक्षणिक संशोधन एजंट (Bilingual - English & मराठी)")
-st.write("हा एआय एजंट सुरक्षित Gemini API चा वापर करून रिसर्च पेपर्सचा इंग्रजी आणि मराठीत तांत्रिक सारांश तयार करतो.")
+    return papers
 
-# मुख्य शोध पट्टी
-search_query = st.text_input("🔎 संशोधनाचा विषय टाईप करा (उदा. 'RAG agents', 'Neural Networks'):")
-limit = st.slider("किती पेपर्स शोधायचे आहेत?", min_value=1, max_value=5, value=2)
 
-async def start_pipeline(query: str, paper_limit: int, key: str):
+# --------------------------------------------------------------------------
+# Async PDF Download + CPU-bound Extraction (isolated to a worker thread)
+# --------------------------------------------------------------------------
+
+async def download_pdf_bytes(session: aiohttp.ClientSession, url: str) -> bytes:
+    try:
+        async with session.get(
+            url, timeout=aiohttp.ClientTimeout(total=HTTP_TIMEOUT_SECONDS)
+        ) as resp:
+            resp.raise_for_status()
+            return await resp.read()
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"Failed to download PDF from {url}: {exc}") from exc
+
+
+def _extract_text_from_pdf_bytes(pdf_bytes: bytes, max_pages: int) -> str:
+    """CPU-bound: run inside asyncio.to_thread to avoid blocking the event loop."""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    num_pages = min(len(reader.pages), max_pages)
+    text_chunks: List[str] = []
+    for i in range(num_pages):
+        try:
+            page_text = reader.pages[i].extract_text() or ""
+            text_chunks.append(page_text)
+        except Exception:  # noqa: BLE001
+            continue
+    full_text = "\n".join(text_chunks).strip()
+    return full_text[:MAX_EXTRACTED_CHARS]
+
+
+async def extract_paper_text(session: aiohttp.ClientSession, pdf_link: str) -> str:
+    pdf_bytes = await download_pdf_bytes(session, pdf_link)
+    text = await asyncio.to_thread(_extract_text_from_pdf_bytes, pdf_bytes, MAX_PDF_PAGES)
+    if not text:
+        raise RuntimeError("No extractable text found in the first pages of the PDF.")
+    return text
+
+
+# --------------------------------------------------------------------------
+# Gemini Structured Bilingual Summarization
+# --------------------------------------------------------------------------
+
+def _build_prompt(title: str, abstract: str, body_text: str) -> str:
+    return f"""You are an expert bilingual academic research analyst fluent in English and Marathi.
+
+Analyze the following research paper and produce a structured bilingual summary.
+
+PAPER TITLE:
+{title}
+
+ABSTRACT:
+{abstract}
+
+EXTRACTED BODY TEXT (first pages):
+{body_text}
+
+Instructions:
+- Write clear, accurate, and natural English.
+- Write fluent, natural, grammatically correct Marathi (not a literal word-for-word translation) that an educated Marathi reader would find natural to read. Use Devanagari script.
+- executive_summary: 2-3 sentences capturing the core contribution of the paper.
+- key_highlights: 3-6 concise bullet points capturing the most important technical points/findings.
+- practical_implications: 2-3 sentences on real-world, industry, or societal impact.
+- Keep both language versions semantically equivalent in meaning.
+Respond strictly according to the provided JSON schema.
+"""
+
+
+def _call_gemini_sync(client: genai.Client, title: str, abstract: str, body_text: str) -> PaperSummary:
+    """Synchronous Gemini call (the SDK is sync); wrapped via asyncio.to_thread by the caller."""
+    prompt = _build_prompt(title, abstract, body_text)
+
+    config = types.GenerateContentConfig(
+        response_mime_type="application/json",
+        response_schema=PaperSummary,
+        temperature=0.3,
+    )
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=config,
+    )
+
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, PaperSummary):
+        return parsed
+
+    # Fallback: manually validate the raw JSON text if .parsed wasn't populated
+    if response.text:
+        return PaperSummary.model_validate_json(response.text)
+
+    raise RuntimeError("Gemini returned an empty or unparsable response.")
+
+
+async def summarize_paper_bilingual(
+    client: genai.Client, title: str, abstract: str, body_text: str
+) -> PaperSummary:
+    return await asyncio.to_thread(_call_gemini_sync, client, title, abstract, body_text)
+
+
+# --------------------------------------------------------------------------
+# Indian-Accent Text-to-Speech
+# --------------------------------------------------------------------------
+
+def build_speech_text(summary: PaperSummary) -> str:
+    highlights_text = ". ".join(summary.key_highlights_en)
+    return (
+        f"{summary.executive_summary_en} "
+        f"Key highlights: {highlights_text}. "
+        f"Practical implications: {summary.practical_implications_en}"
+    )
+
+
+def synthesize_indian_accent_audio(text: str) -> bytes:
+    """Generate MP3 audio bytes using an Indian English accent via gTTS."""
+    tts = gTTS(text=text, lang="en", tld="co.in")
+    buffer = io.BytesIO()
+    tts.write_to_fp(buffer)
+    buffer.seek(0)
+    return buffer.read()
+
+
+# --------------------------------------------------------------------------
+# Orchestration: process a single paper end-to-end, isolating failures
+# --------------------------------------------------------------------------
+
+async def process_single_paper(
+    session: aiohttp.ClientSession, client: genai.Client, paper: ArxivPaper
+) -> ProcessedPaper:
+    result = ProcessedPaper(paper=paper)
+    try:
+        body_text = await extract_paper_text(session, paper.pdf_link)
+        result.extracted_chars = len(body_text)
+
+        summary = await summarize_paper_bilingual(client, paper.title, paper.abstract, body_text)
+        result.summary = summary
+
+        speech_text = build_speech_text(summary)
+        result.audio_bytes = await asyncio.to_thread(synthesize_indian_accent_audio, speech_text)
+
+    except Exception as exc:  # noqa: BLE001
+        result.error = f"{exc}"
+
+    return result
+
+
+async def run_research_pipeline(
+    query: str, max_results: int, api_key: str
+) -> List[ProcessedPaper]:
+    client = genai.Client(api_key=api_key)
+
     async with aiohttp.ClientSession() as session:
-        arxiv_source = ArxivAPIIngestor(session)
-        doc_processor = DocumentProcessor(session)
-        llm_engine = GeminiSummarizationEngine(api_key=key)
-        
-        st.info(f"🔍 '{query}' या विषयावर पेपर्स शोधत आहे...")
-        papers = await arxiv_source.fetch_papers(query, limit=paper_limit)
-        
+        papers = await search_arxiv(session, query, max_results)
         if not papers:
-            st.error("एकही paper सापडला नाही. कृपया शोधताना सोपे शब्द वापरा.")
+            return []
+
+        tasks = [process_single_paper(session, client, p) for p in papers]
+        results = await asyncio.gather(*tasks)
+
+    return list(results)
+
+
+# --------------------------------------------------------------------------
+# Streamlit UI
+# --------------------------------------------------------------------------
+
+def get_api_key() -> Optional[str]:
+    """Securely fetch the Gemini API key from Streamlit secrets only.
+
+    No sidebar, no text field — the key is never exposed in the UI.
+    """
+    try:
+        return st.secrets["GEMINI_API_KEY"]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def render_paper_result(index: int, item: ProcessedPaper) -> None:
+    paper = item.paper
+
+    with st.container(border=True):
+        st.subheader(f"{index}. {paper.title}")
+        meta_cols = st.columns([3, 2])
+        with meta_cols[0]:
+            authors_str = ", ".join(paper.authors) if paper.authors else "Unknown authors"
+            st.caption(f"👤 {authors_str}")
+        with meta_cols[1]:
+            st.caption(f"🗓️ Published: {paper.published[:10]}")
+        st.markdown(f"[🔗 View PDF]({paper.pdf_link})")
+
+        if item.error:
+            st.error(f"⚠️ Could not fully process this paper: {item.error}")
+            with st.expander("Show original abstract"):
+                st.write(paper.abstract)
             return
 
-        st.success(f"एकूण {len(papers)} पेपर्स सापडले. विश्लेषण सुरू आहे...")
-        
-        for i, paper in enumerate(papers):
-            with st.expander(f"📄 Paper {i+1}: {paper.title}", expanded=True):
-                st.markdown(f"**🗓️ तारीख:** {paper.publication_date} | **✍️ लेखक:** {', '.join(paper.authors)}")
-                st.markdown(f"🔗 [मूळ लिंक]({paper.link}) | 📥 [पीडीएफ लिंक]({paper.pdf_link})")
-                
-                with st.spinner("Gemini पेपरचे द्विभाषिक विश्लेषण करत आहे..."):
-                    raw_text = await doc_processor.extract_text_from_pdf(paper.pdf_link)
-                    if not raw_text:
-                        st.error("पीडीएफ वाचता आली नाही.")
-                        continue
-                        
-                    summary = await llm_engine.summarize_paper(raw_text)
-                    
-                    if summary:
-                        # दोन कॉलम्स तयार करणे (डावीकडे इंग्रजी, उजवीकडे मराठी)
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            st.markdown("### 🇬🇧 English Analysis")
-                            st.markdown("#### 🎯 Executive Summary")
-                            st.write(summary.executive_summary_en)
-                            st.markdown("#### 💡 Key Highlights")
-                            highlights_text_en = ""
-                            for bullet in summary.key_highlights_en:
-                                st.write(f"- {bullet}")
-                                highlights_text_en += f"{bullet}. "
-                            st.markdown("#### 🚀 Practical Implications")
-                            st.write(summary.practical_implications_en)
-                            
-                        with col2:
-                            st.markdown("### 🇮🇳 मराठी विश्लेषण")
-                            st.markdown("#### 🎯 मुख्य सारांश")
-                            st.write(summary.executive_summary_mr)
-                            st.markdown("#### 💡 महत्त्वाचे मुद्दे")
-                            for bullet in summary.key_highlights_mr:
-                                st.write(f"- {bullet}")
-                            st.markdown("#### 🚀 व्यावहारिक उपयोग")
-                            st.write(summary.practical_implications_mr)
-                        
-                        st.markdown("---")
-                        # 🎧 Read Aloud Player (फक्त इंग्रजी मजकुराचा ऑडिओ तयार होईल जेणेकरून उच्चार भारतीय इंग्रजीत स्पष्ट येतील)
-                        st.markdown("#### 🎧 Read Aloud (Indian Accent - English Summary)")
-                        
-                        full_audio_text = (
-                            f"Summary for the paper: {paper.title}. "
-                            f"Executive Summary: {summary.executive_summary_en} "
-                            f"Key Highlights: {highlights_text_en} "
-                            f"Practical Implications: {summary.practical_implications_en}"
-                        )
-                        
-                        try:
-                            tts = gTTS(text=full_audio_text, lang='en', tld='co.in', slow=False)
-                            fp = io.BytesIO()
-                            tts.write_to_fp(fp)
-                            fp.seek(0)
-                            st.audio(fp, format='audio/mp3')
-                        except Exception as audio_err:
-                            logger.error(f"Audio creation failure: {str(audio_err)}")
-                            st.warning("ऑडिओ तयार करता आला नाही.")
-                    else:
-                        st.error("सारांश तयार करताना एरर आली.")
+        summary = item.summary
+        if summary is None:
+            st.warning("No summary available.")
+            return
 
-if st.button("🚀 एजंट सुरू करा"):
-    secure_key = st.secrets.get("GEMINI_API_KEY", "")
-    if not secure_key:
-        st.error("त्रुटी: Secrets मध्ये 'GEMINI_API_KEY' सेट केलेली नाही!")
-    elif not search_query:
-        st.warning("कृपया संशोधनाचा विषय टाईप करा.")
-    else:
-        asyncio.run(start_pipeline(search_query, limit, secure_key))
+        st.divider()
+        col_en, col_mr = st.columns(2, gap="large")
+
+        with col_en:
+            st.markdown("### 🇬🇧 English Analysis")
+            st.markdown("**Executive Summary**")
+            st.write(summary.executive_summary_en)
+            st.markdown("**Key Highlights**")
+            for point in summary.key_highlights_en:
+                st.markdown(f"- {point}")
+            st.markdown("**Practical Implications**")
+            st.write(summary.practical_implications_en)
+
+        with col_mr:
+            st.markdown("### 🇮🇳 मराठी विश्लेषण")
+            st.markdown("**कार्यकारी सारांश**")
+            st.write(summary.executive_summary_mr)
+            st.markdown("**ठळक मुद्दे**")
+            for point in summary.key_highlights_mr:
+                st.markdown(f"- {point}")
+            st.markdown("**व्यावहारिक परिणाम**")
+            st.write(summary.practical_implications_mr)
+
+        st.divider()
+        st.markdown("### 🎧 Read Aloud (Indian Accent - English Summary)")
+        if item.audio_bytes:
+            audio_fp = io.BytesIO(item.audio_bytes)
+            st.audio(audio_fp, format="audio/mp3")
+        else:
+            st.info("Audio narration is not available for this paper.")
+
+
+def main() -> None:
+    st.set_page_config(
+        page_title="Autonomous Academic Research Agent",
+        page_icon="🔬",
+        layout="wide",
+    )
+
+    st.title("🔬 Autonomous Academic Research Agent")
+    st.markdown(
+        "Fetch, analyze, and synthesize research papers from **arXiv** into a bilingual "
+        "**English ↔ Marathi** dashboard, complete with Indian-accent audio narration — "
+        "powered by Google Gemini."
+    )
+
+    api_key = get_api_key()
+    if not api_key:
+        st.error(
+            "🔒 `GEMINI_API_KEY` was not found in Streamlit secrets. "
+            "Please configure it under your app's Settings → Secrets before using this app."
+        )
+        st.stop()
+
+    st.markdown("---")
+
+    input_col, slider_col = st.columns([3, 1])
+    with input_col:
+        query = st.text_input(
+            "🔎 Research topic",
+            placeholder="e.g. retrieval augmented generation, quantum error correction, transformer efficiency",
+        )
+    with slider_col:
+        max_results = st.slider("Paper search limit", min_value=1, max_value=5, value=3)
+
+    run_clicked = st.button("🚀 Run Research Agent", type="primary", use_container_width=False)
+
+    if run_clicked:
+        clean_query = query.strip()
+        if not clean_query:
+            st.warning("Please enter a research topic to search for.")
+            st.stop()
+
+        status_placeholder = st.empty()
+        start_time = time.time()
+
+        try:
+            with status_placeholder:
+                with st.spinner(
+                    f"Searching arXiv, downloading PDFs, and generating bilingual "
+                    f"Gemini summaries for up to {max_results} paper(s)..."
+                ):
+                    results = asyncio.run(
+                        run_research_pipeline(clean_query, max_results, api_key)
+                    )
+        except Exception as exc:  # noqa: BLE001
+            status_placeholder.empty()
+            st.error(f"❌ The research pipeline failed: {exc}")
+            with st.expander("Show technical details"):
+                st.code(traceback.format_exc())
+            st.stop()
+
+        status_placeholder.empty()
+        elapsed = time.time() - start_time
+
+        if not results:
+            st.warning("No papers were found for this query. Try a different or broader topic.")
+            st.stop()
+
+        st.success(f"✅ Processed {len(results)} paper(s) in {elapsed:.1f}s.")
+        st.markdown("---")
+
+        for idx, item in enumerate(results, start=1):
+            render_paper_result(idx, item)
+            st.markdown("")
+
+
+if __name__ == "__main__":
+    main()
