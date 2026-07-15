@@ -1,11 +1,16 @@
 """
-Autonomous Academic Research Agent — Institutional Target Filtering Edition
+Autonomous Academic Research Agent — "The Scriptorium" Edition
 -----------------------------------------------------------------------------
 Fetches papers from arXiv (with optional premier-institution boolean
 filtering), extracts full text from the underlying PDFs, summarizes them
 bilingually (English + Marathi) using Google Gemini structured outputs, and
-renders a side-by-side dashboard with an Indian-accent text-to-speech
-"read aloud" feature.
+renders a side-by-side "bound manuscript" dashboard with an Indian-accent
+text-to-speech "read aloud" feature.
+
+Design concept: a digital scriptorium — a bound bilingual manuscript where
+the English leaf (indigo) and the Marathi leaf (sindoor red) sit either
+side of a stitched spine, unified by turmeric-gold rules and dual-script
+Devanagari/Latin display type.
 
 Run locally:
     streamlit run app.py
@@ -396,6 +401,368 @@ async def run_research_pipeline(
 
 
 # --------------------------------------------------------------------------
+# Design System — CSS injection
+# --------------------------------------------------------------------------
+# Palette
+#   --ink        #12141C   primary background (scriptorium at night)
+#   --ink-soft   #1B1E2C   panel / raised surface on dark
+#   --paper      #F6F1E4   manuscript parchment (card surfaces)
+#   --gold       #D6A94B   turmeric / marigold — shared accent, rules, CTAs
+#   --indigo     #4C5FD1   English leaf accent
+#   --sindoor    #C1443D   Marathi leaf accent
+# Type
+#   Display (EN):  Fraunces           Body (EN):  Inter
+#   Display (MR):  Tiro Devanagari Marathi   Body (MR):  Noto Sans Devanagari
+#   Utility/meta:  IBM Plex Mono
+
+def inject_custom_css() -> None:
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,500;0,9..144,600;1,9..144,500&family=Inter:wght@400;500;600;700&family=Tiro+Devanagari+Marathi&family=Noto+Sans+Devanagari:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+        :root{
+            --ink:#12141C;
+            --ink-soft:#1B1E2C;
+            --ink-line:#2C3044;
+            --paper:#F6F1E4;
+            --paper-dim:#EDE6D2;
+            --gold:#D6A94B;
+            --gold-soft:#8A6E33;
+            --indigo:#4C5FD1;
+            --indigo-soft:rgba(76,95,209,0.12);
+            --sindoor:#C1443D;
+            --sindoor-soft:rgba(193,68,61,0.12);
+            --muted:#9BA0B4;
+        }
+
+        html, body, [class*="css"]{
+            font-family:'Inter', sans-serif;
+        }
+
+        .stApp{
+            background:
+                radial-gradient(circle at 12% 8%, rgba(214,169,75,0.08), transparent 40%),
+                radial-gradient(circle at 88% 0%, rgba(76,95,209,0.10), transparent 45%),
+                var(--ink);
+            color:var(--paper);
+        }
+
+        h1,h2,h3{
+            font-family:'Fraunces', serif;
+            color:var(--paper);
+            letter-spacing:-0.01em;
+        }
+
+        p, li, span, label, div{
+            color:var(--paper);
+        }
+
+        /* ---------- Hero ---------- */
+        .scriptorium-hero{
+            padding:3.2rem 3rem 2.6rem 3rem;
+            border-radius:22px;
+            background:linear-gradient(135deg, var(--ink-soft) 0%, #171A28 60%, var(--ink) 100%);
+            border:1px solid var(--ink-line);
+            position:relative;
+            overflow:hidden;
+            margin-bottom:1.6rem;
+        }
+        .scriptorium-hero::after{
+            content:"";
+            position:absolute;
+            top:-40%; right:-10%;
+            width:420px; height:420px;
+            background:radial-gradient(circle, rgba(214,169,75,0.16), transparent 65%);
+            pointer-events:none;
+        }
+        .hero-eyebrow{
+            font-family:'IBM Plex Mono', monospace;
+            font-size:0.72rem;
+            letter-spacing:0.16em;
+            text-transform:uppercase;
+            color:var(--gold);
+            display:inline-flex;
+            align-items:center;
+            gap:0.5rem;
+            margin-bottom:1.1rem;
+        }
+        .hero-eyebrow::before{
+            content:"";
+            width:7px; height:7px;
+            border-radius:50%;
+            background:var(--gold);
+            box-shadow:0 0 8px 2px rgba(214,169,75,0.6);
+        }
+        .hero-title-en{
+            font-family:'Fraunces', serif;
+            font-weight:500;
+            font-size:2.9rem;
+            line-height:1.08;
+            color:var(--paper);
+            margin:0 0 0.35rem 0;
+        }
+        .hero-title-mr{
+            font-family:'Tiro Devanagari Marathi', serif;
+            font-size:2.15rem;
+            line-height:1.3;
+            color:var(--gold);
+            margin:0 0 1.1rem 0;
+        }
+        .hero-sub{
+            font-size:1.02rem;
+            color:var(--muted);
+            max-width:640px;
+            line-height:1.6;
+        }
+        .hero-rule{
+            width:64px;
+            height:3px;
+            background:linear-gradient(90deg, var(--indigo), var(--gold), var(--sindoor));
+            border-radius:3px;
+            margin:1.3rem 0 0 0;
+        }
+
+        /* ---------- Console (controls) card ---------- */
+        div[data-testid="stVerticalBlockBorderWrapper"]{
+            background:var(--ink-soft) !important;
+            border:1px solid var(--ink-line) !important;
+            border-radius:18px !important;
+        }
+
+        .console-label{
+            font-family:'IBM Plex Mono', monospace;
+            font-size:0.72rem;
+            letter-spacing:0.1em;
+            text-transform:uppercase;
+            color:var(--gold);
+            margin-bottom:0.4rem;
+        }
+
+        /* Text input */
+        .stTextInput input{
+            background:var(--ink) !important;
+            color:var(--paper) !important;
+            border:1px solid var(--ink-line) !important;
+            border-radius:10px !important;
+            padding:0.7rem 0.9rem !important;
+        }
+        .stTextInput input:focus{
+            border-color:var(--gold) !important;
+            box-shadow:0 0 0 1px var(--gold) !important;
+        }
+        .stTextInput input::placeholder{
+            color:var(--muted) !important;
+        }
+
+        /* Multiselect */
+        .stMultiSelect > div > div{
+            background:var(--ink) !important;
+            border:1px solid var(--ink-line) !important;
+            border-radius:10px !important;
+        }
+        span[data-baseweb="tag"]{
+            background:var(--indigo) !important;
+            border-radius:6px !important;
+        }
+
+        /* Slider */
+        div[data-testid="stSlider"] div[role="slider"]{
+            background-color:var(--gold) !important;
+        }
+        div[data-testid="stSlider"] > div > div > div{
+            background:linear-gradient(90deg, var(--indigo), var(--gold)) !important;
+        }
+
+        /* Buttons */
+        .stButton button{
+            background:linear-gradient(135deg, var(--gold) 0%, #C79539 100%) !important;
+            color:var(--ink) !important;
+            border:none !important;
+            border-radius:10px !important;
+            font-weight:600 !important;
+            padding:0.65rem 1.6rem !important;
+            letter-spacing:0.01em;
+            transition:transform 0.15s ease, box-shadow 0.15s ease;
+            box-shadow:0 4px 14px rgba(214,169,75,0.25);
+        }
+        .stButton button:hover{
+            transform:translateY(-1px);
+            box-shadow:0 6px 20px rgba(214,169,75,0.35);
+        }
+        .stButton button:active{
+            transform:translateY(0px);
+        }
+
+        /* Expander (query preview) */
+        div[data-testid="stExpander"]{
+            border:1px dashed var(--ink-line) !important;
+            border-radius:12px !important;
+            background:var(--ink) !important;
+        }
+
+        /* Code block (query preview ticket) */
+        .stCodeBlock, pre{
+            font-family:'IBM Plex Mono', monospace !important;
+            border-radius:10px !important;
+        }
+
+        /* Captions */
+        [data-testid="stCaptionContainer"]{
+            font-family:'IBM Plex Mono', monospace;
+            color:var(--muted) !important;
+        }
+
+        /* Dividers */
+        hr{
+            border-color:var(--ink-line) !important;
+        }
+
+        /* Audio player */
+        audio{
+            width:100%;
+            border-radius:10px;
+            accent-color:var(--gold);
+        }
+
+        /* ---------- Folio (paper) card internals ---------- */
+        .folio-meta-row{
+            display:flex;
+            flex-wrap:wrap;
+            gap:0.5rem;
+            margin-bottom:0.9rem;
+        }
+        .folio-chip{
+            font-family:'IBM Plex Mono', monospace;
+            font-size:0.72rem;
+            padding:0.28rem 0.7rem;
+            border-radius:999px;
+            border:1px solid var(--ink-line);
+            color:var(--muted);
+            background:rgba(255,255,255,0.02);
+        }
+        .folio-chip.gold{
+            color:var(--gold);
+            border-color:rgba(214,169,75,0.4);
+        }
+        .folio-link a{
+            font-family:'IBM Plex Mono', monospace;
+            font-size:0.8rem;
+            color:var(--gold) !important;
+            text-decoration:none;
+        }
+        .folio-link a:hover{
+            text-decoration:underline;
+        }
+
+        .leaf-header{
+            display:flex;
+            align-items:center;
+            gap:0.55rem;
+            padding:0.55rem 0.9rem;
+            border-radius:10px;
+            margin-bottom:0.9rem;
+            font-family:'IBM Plex Mono', monospace;
+            font-size:0.78rem;
+            letter-spacing:0.06em;
+            text-transform:uppercase;
+        }
+        .leaf-header.en{
+            background:var(--indigo-soft);
+            color:#8E9BFF;
+            border-left:3px solid var(--indigo);
+        }
+        .leaf-header.mr{
+            background:var(--sindoor-soft);
+            color:#F0908A;
+            border-left:3px solid var(--sindoor);
+        }
+
+        .leaf-block-label{
+            font-size:0.82rem;
+            font-weight:600;
+            color:var(--gold);
+            margin:0.9rem 0 0.3rem 0;
+            text-transform:uppercase;
+            letter-spacing:0.04em;
+        }
+        .leaf-block-label.mr{
+            font-family:'Tiro Devanagari Marathi', serif;
+            text-transform:none;
+            letter-spacing:0;
+            font-size:1rem;
+        }
+
+        .mr-text, .mr-text li, .mr-text p{
+            font-family:'Noto Sans Devanagari', 'Inter', sans-serif !important;
+            font-size:1.02rem;
+            line-height:1.85;
+        }
+        .en-text, .en-text li, .en-text p{
+            font-family:'Inter', sans-serif;
+            font-size:0.97rem;
+            line-height:1.7;
+        }
+
+        .audio-dock-label{
+            font-family:'IBM Plex Mono', monospace;
+            font-size:0.75rem;
+            letter-spacing:0.08em;
+            text-transform:uppercase;
+            color:var(--gold);
+            margin:0.3rem 0 0.5rem 0;
+        }
+
+        .error-note{
+            font-family:'IBM Plex Mono', monospace;
+            font-size:0.85rem;
+        }
+
+        .scriptorium-footer{
+            text-align:center;
+            padding:1.6rem 0 0.6rem 0;
+            color:var(--muted);
+            font-family:'IBM Plex Mono', monospace;
+            font-size:0.75rem;
+            letter-spacing:0.03em;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_hero() -> None:
+    st.markdown(
+        """
+        <div class="scriptorium-hero">
+            <div class="hero-eyebrow">Autonomous Academic Research Agent · arXiv → EN / MR</div>
+            <div class="hero-title-en">Bilingual research, synthesized.</div>
+            <div class="hero-title-mr">द्विभाषिक संशोधन, संश्लेषित.</div>
+            <div class="hero-sub">
+                A digital scriptorium that reads open-access papers from arXiv, filters by the
+                institutions that matter to you, and binds each finding into an English and
+                Marathi leaf — read side by side, or aloud in an Indian English accent.
+            </div>
+            <div class="hero-rule"></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_footer() -> None:
+    st.markdown(
+        """
+        <div class="scriptorium-footer">
+            SOURCED FROM ARXIV.ORG &nbsp;·&nbsp; SYNTHESIZED BY GEMINI 2.5 FLASH &nbsp;·&nbsp; NARRATED IN EN-IN
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# --------------------------------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------------------------------
 
@@ -414,24 +781,28 @@ def render_paper_result(index: int, item: ProcessedPaper) -> None:
     paper = item.paper
 
     with st.container(border=True):
-        st.subheader(f"{index}. {paper.title}")
+        st.markdown(f"### {index:02d} &nbsp; {paper.title}", unsafe_allow_html=True)
 
-        meta_cols = st.columns([3, 2, 2])
-        with meta_cols[0]:
-            authors_str = ", ".join(paper.authors) if paper.authors else "Unknown authors"
-            st.caption(f"👤 {authors_str}")
-        with meta_cols[1]:
-            st.caption(f"🗓️ Published: {paper.published[:10]}")
-        with meta_cols[2]:
-            if paper.target_institutions:
-                st.caption(f"🏛️ Target filter: {', '.join(paper.target_institutions)}")
-            else:
-                st.caption("🏛️ Target filter: All institutions")
+        authors_str = ", ".join(paper.authors) if paper.authors else "Unknown authors"
+        institution_label = ", ".join(paper.target_institutions) if paper.target_institutions else "All institutions"
 
-        st.markdown(f"[🔗 View PDF]({paper.pdf_link})")
+        st.markdown(
+            f"""
+            <div class="folio-meta-row">
+                <span class="folio-chip">👤 {authors_str}</span>
+                <span class="folio-chip">🗓️ {paper.published[:10]}</span>
+                <span class="folio-chip gold">🏛️ {institution_label}</span>
+                <span class="folio-chip folio-link"><a href="{paper.pdf_link}" target="_blank">🔗 View PDF ↗</a></span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
         if item.error:
-            st.error(f"⚠️ Could not fully process this paper: {item.error}")
+            st.markdown(
+                f"""<div class="error-note">⚠️ Could not fully process this paper: {item.error}</div>""",
+                unsafe_allow_html=True,
+            )
             with st.expander("Show original abstract"):
                 st.write(paper.abstract)
             return
@@ -441,31 +812,39 @@ def render_paper_result(index: int, item: ProcessedPaper) -> None:
             st.warning("No summary available.")
             return
 
-        st.divider()
         col_en, col_mr = st.columns(2, gap="large")
 
         with col_en:
-            st.markdown("### 🇬🇧 English Analysis")
-            st.markdown("**Executive Summary**")
-            st.write(summary.executive_summary_en)
-            st.markdown("**Key Highlights**")
-            for point in summary.key_highlights_en:
-                st.markdown(f"- {point}")
-            st.markdown("**Practical Implications**")
-            st.write(summary.practical_implications_en)
+            st.markdown('<div class="leaf-header en">🇬🇧 English Analysis</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="leaf-block-label">Executive Summary</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="en-text">{summary.executive_summary_en}</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="leaf-block-label">Key Highlights</div>', unsafe_allow_html=True)
+            highlights_html = "".join(f"<li>{point}</li>" for point in summary.key_highlights_en)
+            st.markdown(f'<ul class="en-text">{highlights_html}</ul>', unsafe_allow_html=True)
+
+            st.markdown('<div class="leaf-block-label">Practical Implications</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="en-text">{summary.practical_implications_en}</div>', unsafe_allow_html=True)
 
         with col_mr:
-            st.markdown("### 🇮🇳 मराठी विश्लेषण")
-            st.markdown("**कार्यकारी सारांश**")
-            st.write(summary.executive_summary_mr)
-            st.markdown("**ठळक मुद्दे**")
-            for point in summary.key_highlights_mr:
-                st.markdown(f"- {point}")
-            st.markdown("**व्यावहारिक परिणाम**")
-            st.write(summary.practical_implications_mr)
+            st.markdown('<div class="leaf-header mr">🇮🇳 मराठी विश्लेषण</div>', unsafe_allow_html=True)
 
-        st.divider()
-        st.markdown("### 🎧 Read Aloud (Indian Accent - English Summary)")
+            st.markdown('<div class="leaf-block-label mr">कार्यकारी सारांश</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="mr-text">{summary.executive_summary_mr}</div>', unsafe_allow_html=True)
+
+            st.markdown('<div class="leaf-block-label mr">ठळक मुद्दे</div>', unsafe_allow_html=True)
+            highlights_html_mr = "".join(f"<li>{point}</li>" for point in summary.key_highlights_mr)
+            st.markdown(f'<ul class="mr-text">{highlights_html_mr}</ul>', unsafe_allow_html=True)
+
+            st.markdown('<div class="leaf-block-label mr">व्यावहारिक परिणाम</div>', unsafe_allow_html=True)
+            st.markdown(f'<div class="mr-text">{summary.practical_implications_mr}</div>', unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.markdown(
+            '<div class="audio-dock-label">🎧 Read Aloud — Indian Accent (English Summary)</div>',
+            unsafe_allow_html=True,
+        )
         if item.audio_bytes:
             audio_fp = io.BytesIO(item.audio_bytes)
             st.audio(audio_fp, format="audio/mp3")
@@ -475,17 +854,13 @@ def render_paper_result(index: int, item: ProcessedPaper) -> None:
 
 def main() -> None:
     st.set_page_config(
-        page_title="Autonomous Academic Research Agent",
-        page_icon="🔬",
+        page_title="The Scriptorium — Autonomous Research Agent",
+        page_icon="🪶",
         layout="wide",
     )
 
-    st.title("🔬 Autonomous Academic Research Agent")
-    st.markdown(
-        "Fetch, analyze, and synthesize research papers from **arXiv** into a bilingual "
-        "**English ↔ Marathi** dashboard, with optional filtering by premier institutions "
-        "and Indian-accent audio narration — powered by Google Gemini."
-    )
+    inject_custom_css()
+    render_hero()
 
     api_key = get_api_key()
     if not api_key:
@@ -495,30 +870,36 @@ def main() -> None:
         )
         st.stop()
 
-    st.markdown("---")
-
-    query = st.text_input(
-        "🔎 Research topic",
-        placeholder="e.g. retrieval augmented generation, quantum error correction, transformer efficiency",
-    )
-
-    filter_col, slider_col = st.columns([3, 1])
-    with filter_col:
-        institutions = st.multiselect(
-            "🏛️ Filter by target institutions (optional)",
-            options=PREMIER_INSTITUTIONS,
-            default=[],
-            help="Leave empty to search across all institutions. When selected, the arXiv "
-                 "query is dynamically rebuilt with an institutional boolean filter clause.",
+    with st.container(border=True):
+        st.markdown('<div class="console-label">Step 01 · Define your inquiry</div>', unsafe_allow_html=True)
+        query = st.text_input(
+            "Research topic",
+            placeholder="e.g. retrieval augmented generation, quantum error correction, transformer efficiency",
+            label_visibility="collapsed",
         )
-    with slider_col:
-        max_results = st.slider("Paper search limit", min_value=1, max_value=5, value=3)
 
-    with st.expander("🧠 Preview generated arXiv query"):
-        preview_query = build_arxiv_search_query(query.strip() or "<topic>", institutions)
-        st.code(preview_query, language="text")
+        st.markdown(
+            '<div class="console-label" style="margin-top:1.1rem;">Step 02 · Narrow the target</div>',
+            unsafe_allow_html=True,
+        )
+        filter_col, slider_col = st.columns([3, 1])
+        with filter_col:
+            institutions = st.multiselect(
+                "Filter by target institutions (optional)",
+                options=PREMIER_INSTITUTIONS,
+                default=[],
+                help="Leave empty to search across all institutions. When selected, the arXiv "
+                     "query is dynamically rebuilt with an institutional boolean filter clause.",
+                label_visibility="collapsed",
+            )
+        with slider_col:
+            max_results = st.slider("Paper limit", min_value=1, max_value=5, value=3)
 
-    run_clicked = st.button("🚀 Run Research Agent", type="primary", use_container_width=False)
+        with st.expander("🧠 Preview generated arXiv query"):
+            preview_query = build_arxiv_search_query(query.strip() or "<topic>", institutions)
+            st.code(preview_query, language="text")
+
+        run_clicked = st.button("🚀  Run Research Agent", type="primary")
 
     if run_clicked:
         clean_query = query.strip()
@@ -557,11 +938,13 @@ def main() -> None:
             st.stop()
 
         st.success(f"✅ Processed {len(results)} paper(s) in {elapsed:.1f}s.")
-        st.markdown("---")
+        st.markdown("###")
 
         for idx, item in enumerate(results, start=1):
             render_paper_result(idx, item)
-            st.markdown("")
+            st.markdown("###")
+
+    render_footer()
 
 
 if __name__ == "__main__":
